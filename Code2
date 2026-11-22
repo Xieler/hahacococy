@@ -1,0 +1,28 @@
+preds_by_rec = {}
+w_row = best_w_nn.reshape(1, -1)
+
+for rec_id in sub['recording_id'].unique():
+    emg_test = np.load(TEST_SIGNALS_DIR / f"{rec_id}.npy")
+    T_test = len(emg_test)
+    spec_x = compute_stft_frames(emg_test)
+    tab_x = extract_tabular_frames(spec_x)
+    nn_folds, rd_folds = [], []
+    for (mean_sp, std_sp, m_nn, m_rd) in fold_artifacts:
+        vx = (spec_x - mean_sp) / std_sp
+        nn_folds.append(predict_spectro_turbo(m_nn, vx, T_test))
+        rd_frames = m_rd.predict(tab_x).astype(np.float32)
+        rd_folds.append(resample_array(rd_frames, T_test))
+    p_nn_avg = smooth_predictions(np.mean(nn_folds, axis=0))
+    p_rd_avg = smooth_predictions(np.mean(rd_folds, axis=0))
+    rec_final = p_nn_avg * w_row + p_rd_avg * (1.0 - w_row)
+    preds_by_rec[rec_id] = np.clip(rec_final, -np.pi, np.pi)
+
+for rec_id, group in sub.groupby('recording_id', sort=False):
+    indices = group['sample_index'].to_numpy()
+    rec_preds = preds_by_rec.get(rec_id)
+    sub.loc[group.index, angle_cols] = rec_preds.take(indices, axis=0)
+
+assert not sub[angle_cols].isna().any().any(), "Ошибка: обнаружены NaN!"
+assert np.isfinite(sub[angle_cols].to_numpy()).all(), "Ошибка: обнаружены Inf!"
+sub.to_csv(SUBMISSION_PATH, index=False)
+print(f"ГОТОВО! Итоговый сабмит сохранён в {SUBMISSION_PATH}. Форма: {sub.shape}")
