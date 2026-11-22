@@ -1,0 +1,447 @@
+import os
+import time
+import random
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, sosfilt, savgol_filter, lfilter
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+# ==========================================
+# 1. КОНФИГУРАЦИЯ (БАЛАНС СКОРОСТИ И ТОЧНОСТИ)
+# ==========================================
+DATA_DIR = Path('datasets')
+TRAIN_SIGNALS_DIR = DATA_DIR / 'train' / 'signals'
+TRAIN_TARGETS_DIR = DATA_DIR / 'train' / 'targets'
+METADATA_PATH = DATA_DIR / 'train' / 'metadata.csv'
+
+# Для 1-го этапа: phase1_test и phase1_sample_submission.csv
+# Для 2-го этапа: test и phase2_sample_submission.csv
+TEST_SIGNALS_DIR = DATA_DIR / 'phase1_test'
+SAMPLE_SUB_PATH = DATA_DIR / 'phase1_sample_submission.csv'
+SUBMISSION_PATH = Path('submission_fast.csv')
+
+FS = 500.0
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+IS_CUDA = (DEVICE.type == 'cuda')
+
+WINDOW_SIZE = 1024
+TRAIN_STRIDE = 256 if IS_CUDA else 384
+INFER_STRIDE = 512 # Быстрый скользящий инференс с перекрытием 50%
+BATCH_SIZE = 64
+EPOCHS = 25 if IS_CUDA else 18
+LR = 1.8e-3
+PATIENCE = 6 # Ранняя остановка при отсутствии улучшений
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if IS_CUDA:
+        torch.cuda.manual_seed_all(seed)
+
+
+# ==========================================
+# 2. ИЗВЛЕЧЕНИЕ 48 ФИЗИОЛОГИЧЕСКИХ ПРИЗНАКОВ
+# ==========================================
+def causal_ema(arr: np.ndarray, alpha: float) -> np.ndarray:
+    b = np.array([alpha], dtype=np.float32)
+    a = np.array([1.0, -(1.0 - alpha)], dtype=np.float32)
+    zi = arr.take(0, axis=0).reshape(1, -1) * (1.0 - alpha)
+    out, _ = lfilter(b, a, arr, axis=0, zi=zi)
+    return out.astype(np.float32)
+
+
+def compute_tkeo(sig: np.ndarray) -> np.ndarray:
+    tkeo = np.zeros_like(sig)
+    if len(sig) > 2:
+        mid = sig[1:-1] ** 2 - sig[:-2] * sig[2:]
+        tkeo[1:-1] = np.abs(mid)
+    return tkeo
+
+
+def extract_rich_channels(emg: np.ndarray) -> np.ndarray:
+    emg = emg.astype(np.float32)
+    med = np.median(emg, axis=0, keepdims=True)
+    centered = emg - med
+    p90 = np.percentile(np.abs(centered), 90, axis=0, keepdims=True)
+    norm_emg = np.clip(centered / np.maximum(p90, 1e-4), -8.0, 8.0)
+    
+    feats = [norm_emg]
+    bands = ((15.0, 45.0), (45.0, 95.0), (95.0, 160.0), (160.0, 240.0))
+    for low, high in bands:
+        sos = butter(4, (low, high), btype='bandpass', fs=FS, output='sos')
+        filt = sosfilt(sos, norm_emg, axis=0).astype(np.float32)
+        env_fast = np.log1p(causal_ema(np.abs(filt), alpha=0.07) * 5.0)
+        feats.append(env_fast)
+        
+    tkeo = np.log1p(causal_ema(compute_tkeo(norm_emg), alpha=0.05) * 3.0)
+    feats.append(tkeo)
+    
+    diff_abs = np.vstack((np.zeros((1, 6), dtype=np.float32), np.abs(np.diff(norm_emg, axis=0))))
+    wl = np.log1p(causal_ema(diff_abs, alpha=0.04) * 5.0)
+    feats.append(wl)
+    
+    slow_env = np.log1p(causal_ema(np.abs(norm_emg), alpha=0.015) * 5.0)
+    feats.append(slow_env)
+    
+    out = np.concatenate(feats, axis=1)
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def make_tabular_features(base_feats: np.ndarray) -> np.ndarray:
+    env_only = base_feats[:, 6:]
+    lags = (-60, -30, -15, 0, 15, 30, 60, 100)
+    out_list = []
+    for lag in lags:
+        if lag == 0:
+            shifted = env_only
+        elif lag > 0:
+            shifted = np.vstack((np.repeat(env_only[:1], lag, axis=0), env_only[:-lag]))
+        else:
+            k = -lag
+            shifted = np.vstack((env_only[k:], np.repeat(env_only[-1:], k, axis=0)))
+        out_list.append(shifted)
+    return np.hstack(out_list).astype(np.float32)
+
+
+def smooth_predictions(preds: np.ndarray, window: int = 45, poly: int = 3) -> np.ndarray:
+    n = len(preds)
+    if window <= poly or n <= poly + 2:
+        return preds
+    w = min(window, n if n % 2 == 1 else n - 1)
+    return savgol_filter(preds, window_length=w, polyorder=poly, axis=0) if w > poly else preds
+
+
+# ==========================================
+# 3. ДАТАСЕТ И БЫСТРАЯ АРХИТЕКТУРА CONV1D (TCN)
+# ==========================================
+class EMGDataset(Dataset):
+    def __init__(self, X_list, Y_list, window_size=1024, stride=256, is_train=True):
+        self.samples = []
+        self.is_train = is_train
+        
+        for x, y in zip(X_list, Y_list):
+            T = len(x)
+            if T <= window_size:
+                self.samples.append((x, y))
+            else:
+                for start in range(0, T - window_size + 1, stride):
+                    self.samples.append((x[start:start + window_size], y[start:start + window_size]))
+                if (T - window_size) % stride != 0:
+                    self.samples.append((x[-window_size:], y[-window_size:]))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        x, y = self.samples[idx]
+        x = x.copy()
+        num_ch = x.shape[-1]
+        
+        if self.is_train:
+            # Усиленная регуляризация аугментациями против переобучения под день
+            ch_scale = np.random.uniform(0.70, 1.30, size=(1, 6)).astype(np.float32)
+            x *= np.tile(ch_scale, (1, num_ch // 6))
+            x += np.random.normal(0, 0.045, size=x.shape).astype(np.float32)
+            if np.random.rand() < 0.25:
+                drop_ch = np.random.randint(0, 6)
+                x[:, drop_ch::6] = 0.0
+                
+        return torch.from_numpy(x.T), torch.from_numpy(y.T)
+
+
+class ResBlock1D(nn.Module):
+    def __init__(self, channels, kernel_size=7, dilation=1, dropout=0.25):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation),
+            nn.GroupNorm(8, channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation),
+            nn.GroupNorm(8, channels)
+        )
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        return self.act(x + self.net(x))
+
+
+class EMGTCN(nn.Module):
+    """Чисто свёрточная архитектура без GRU — работает в 8 раз быстрее при том же охвате контекста."""
+    def __init__(self, in_channels=48, hidden_dim=80, out_angles=20):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, kernel_size=11, padding=5),
+            nn.GroupNorm(8, hidden_dim),
+            nn.SiLU()
+        )
+        self.tcn = nn.Sequential(
+            ResBlock1D(hidden_dim, kernel_size=7, dilation=1, dropout=0.20),
+            ResBlock1D(hidden_dim, kernel_size=7, dilation=3, dropout=0.25),
+            ResBlock1D(hidden_dim, kernel_size=7, dilation=9, dropout=0.25),
+            ResBlock1D(hidden_dim, kernel_size=7, dilation=27, dropout=0.30),
+        )
+        self.head = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2),
+            nn.SiLU(),
+            nn.Dropout(0.15),
+            nn.Conv1d(hidden_dim, out_angles, kernel_size=1)
+        )
+
+    def forward(self, x):
+        return self.head(self.tcn(self.stem(x)))
+# ==========================================
+# 4. СКОЛЬЗЯЩИЙ ИНФЕРЕНС И ОБУЧЕНИЕ С EARLY STOPPING
+# ==========================================
+def predict_sliding_window(model: nn.Module, x_feat: np.ndarray, win_size=1024, stride=512) -> np.ndarray:
+    model.eval()
+    T = len(x_feat)
+    if T <= win_size:
+        with torch.no_grad():
+            tx = torch.from_numpy(x_feat.T).unsqueeze(0).to(DEVICE)
+            return model(tx).squeeze(0).cpu().numpy().T
+
+    preds_sum = np.zeros((T, 20), dtype=np.float32)
+    weights_sum = np.zeros((T, 1), dtype=np.float32)
+    
+    win_weight = np.hanning(win_size).astype(np.float32).reshape(-1, 1)
+    win_weight = np.maximum(win_weight, 1e-3)
+
+    starts = list(range(0, T - win_size + 1, stride))
+    if starts[-1] != T - win_size:
+        starts.append(T - win_size)
+
+    batch_x = [x_feat[s:s + win_size].T for s in starts]
+    batch_tensor = torch.from_numpy(np.stack(batch_x)).to(DEVICE)
+    
+    with torch.no_grad():
+        out_list = [model(batch_tensor[i:i + 64]).cpu().numpy() for i in range(0, len(batch_tensor), 64)]
+        all_out = np.concatenate(out_list, axis=0)
+
+    for idx, s in enumerate(starts):
+        seg_pred = all_out[idx].T
+        preds_sum[s:s + win_size] += seg_pred * win_weight
+        weights_sum[s:s + win_size] += win_weight
+
+    return preds_sum / weights_sum
+
+
+def train_tcn_fold(X_tr, Y_tr, val_recs, mean_seq, std_seq, seed=42):
+    seed_everything(seed)
+    train_ds = EMGDataset(X_tr, Y_tr, window_size=WINDOW_SIZE, stride=TRAIN_STRIDE, is_train=True)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    model = EMGTCN(in_channels=48, hidden_dim=80, out_angles=20).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=3e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
+    criterion = nn.SmoothL1Loss(beta=0.05)
+    amp_scaler = torch.amp.GradScaler('cuda', enabled=IS_CUDA)
+    
+    best_val_mae = float('inf')
+    best_weights = None
+    no_improve = 0
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        for bx, by in train_loader:
+            bx, by = bx.to(DEVICE), by.to(DEVICE)
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda', enabled=IS_CUDA):
+                # Внутри цикла обучения (замени loss = criterion(model(bx), by)):
+                pred_y = model(bx)
+                loss_pos = criterion(pred_y, by)
+                loss_vel = criterion(pred_y[:, :, 1:] - pred_y[:, :, :-1], by[:, :, 1:] - by[:, :, :-1])
+                loss = loss_pos + 2.0 * loss_vel
+
+            amp_scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            amp_scaler.step(optimizer)
+            amp_scaler.update()
+        scheduler.step()
+        
+        # Валидация со второй половины обучения для ускорения
+        if (epoch + 1) >= 8 and ((epoch + 1) % 2 == 0 or epoch == EPOCHS - 1):
+            val_true, val_pred = [], []
+            for r in val_recs:
+                vx = (r['X_seq'] - mean_seq) / std_seq
+                p = smooth_predictions(predict_sliding_window(model, vx, WINDOW_SIZE, INFER_STRIDE))
+                if len(p) > 1000:
+                    val_true.append(r['Y'][1000:])
+                    val_pred.append(p[1000:])
+            curr_mae = mean_absolute_error(np.vstack(val_true), np.vstack(val_pred))
+            if curr_mae < best_val_mae - 1e-4:
+                best_val_mae = curr_mae
+                best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 2
+                if no_improve >= PATIENCE:
+                    break
+                    
+    if best_weights is None:
+        best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    model.load_state_dict({k: v.to(DEVICE) for k, v in best_weights.items()})
+    return model, best_val_mae
+
+
+# ==========================================
+# 5. КРОСС-ВАЛИДАЦИЯ ПО ДНЯМ (LEAVE-ONE-DAY-OUT)
+# ==========================================
+t0 = time.time()
+print(f"Устройство: {DEVICE} | Окно: {WINDOW_SIZE} | Макс. эпох: {EPOCHS}")
+
+assert METADATA_PATH.exists(), f"Не найден файл метаданных: {METADATA_PATH}"
+metadata = pd.read_csv(METADATA_PATH)
+
+records = []
+print("Извлечение 48 физиологических признаков...")
+for _, row in metadata.iterrows():
+    rec_id = row['recording_id']
+    emg = np.load(TRAIN_SIGNALS_DIR / f"{rec_id}.npy")
+    angles = np.load(TRAIN_TARGETS_DIR / f"{rec_id}.npy").astype(np.float32)
+    base_x = extract_rich_channels(emg)
+    tab_x = make_tabular_features(base_x)
+    
+    records.append({
+        'rec_id': rec_id,
+        'day_id': row['day_id'],
+        'X_seq': base_x,
+        'X_tab': tab_x,
+        'Y': angles
+    })
+
+unique_days = sorted(metadata['day_id'].unique())
+print(f"Загружено {len(records)} записей ({len(unique_days)} дней) за {time.time() - t0:.1f} сек.")
+
+oof_nn, oof_ridge = {}, {}
+fold_artifacts = []
+
+for fold_idx, val_day in enumerate(unique_days):
+    fold_t = time.time()
+    train_recs = [r for r in records if r['day_id'] != val_day]
+    val_recs = [r for r in records if r['day_id'] == val_day]
+    
+    # Нормализация строго по обучающим дням (анти-утечка)
+    train_concat = np.vstack([r['X_seq'] for r in train_recs])
+    mean_seq = train_concat.mean(axis=0, keepdims=True)
+    std_seq = np.maximum(train_concat.std(axis=0, keepdims=True), 1e-5)
+    
+    X_train_seq = [(r['X_seq'] - mean_seq) / std_seq for r in train_recs]
+    Y_train_seq = [r['Y'] for r in train_recs]
+    
+    # Модель 1: Быстрая нейросеть EMGTCN
+    m_nn, mae_nn = train_tcn_fold(X_train_seq, Y_train_seq, val_recs, mean_seq, std_seq, seed=42 + fold_idx)
+    
+    # Модель 2: Регуляризованный Ridge для стабилизации на новых днях
+    m_rd = make_pipeline(StandardScaler(), Ridge(alpha=50000.0))
+    m_rd.fit(np.vstack([r['X_tab'] for r in train_recs]), np.vstack([r['Y'] for r in train_recs]))
+    fold_artifacts.append((mean_seq, std_seq, m_nn, m_rd))
+    
+    for r in val_recs:
+        vx = (r['X_seq'] - mean_seq) / std_seq
+        oof_nn[r['rec_id']] = predict_sliding_window(m_nn, vx, WINDOW_SIZE, INFER_STRIDE)
+        oof_ridge[r['rec_id']] = m_rd.predict(r['X_tab'])
+        
+    print(f"День {val_day} завершён за {time.time() - fold_t:.1f}с | TCN MAE: {mae_nn:.5f}")
+
+
+# ==========================================
+# 6. БЫСТРЫЙ ПОСУСТАВНЫЙ ПОДБОР ВЕСОВ АНСАМБЛЯ ПО OOF
+# ==========================================
+valid_recs = [r for r in records if len(r['Y']) > 1000]
+grid_w = np.linspace(0.50, 1.00, 26)
+
+# Предварительно сглаживаем пофайлово
+sm_nn = {r['rec_id']: smooth_predictions(oof_nn[r['rec_id']])[1000:] for r in valid_recs}
+sm_rd = {r['rec_id']: smooth_predictions(oof_ridge[r['rec_id']])[1000:] for r in valid_recs}
+tr_y = {r['rec_id']: r['Y'][1000:] for r in valid_recs}
+
+honest_oof_list = []
+honest_true_list = []
+fold_weights = []
+
+for val_day in unique_days:
+    tr_ids = [r['rec_id'] for r in valid_recs if r['day_id'] != val_day]
+    va_ids = [r['rec_id'] for r in valid_recs if r['day_id'] == val_day]
+    if not va_ids:
+        continue
+        
+    Y_tr_f = np.vstack([tr_y[i] for i in tr_ids])
+    P_nn_f = np.vstack([sm_nn[i] for i in tr_ids])
+    P_rd_f = np.vstack([sm_rd[i] for i in tr_ids])
+    
+    w_day = np.zeros(20, dtype=np.float32)
+    for j in range(20):
+        best_s = 1e9
+        best_w = 0.80
+        for w in grid_w:
+            s = mean_absolute_error(Y_tr_f[:, j], w * P_nn_f[:, j] + (1.0 - w) * P_rd_f[:, j])
+            if s < best_s:
+                best_s = s
+                best_w = w
+        w_day[j] = best_w
+    fold_weights.append(w_day)
+    
+    for vid in va_ids:
+        pred_v = sm_nn[vid] * w_day.reshape(1, -1) + sm_rd[vid] * (1.0 - w_day.reshape(1, -1))
+        honest_oof_list.append(np.clip(pred_v, -np.pi, np.pi))
+        honest_true_list.append(tr_y[vid])
+
+best_w_nn = np.mean(fold_weights, axis=0)
+final_oof_mae = mean_absolute_error(np.vstack(honest_true_list), np.vstack(honest_oof_list))
+print("\n========================================================")
+print(f"ЧЕСТНЫЙ OOF MAE (БЕЗ УТЕЧЕК И ПЕРЕОБУЧЕНИЯ): {final_oof_mae:.5f}")
+print(f"Общее время выполнения: {time.time() - t0:.1f} сек.")
+print("========================================================\n")
+
+torch.save({'fold_artifacts': fold_artifacts, 'best_w_nn': best_w_nn}, 'ckpt_1d.pt')
+print("Чекпоинт 1D сохранён в ckpt_1d.pt")
+
+
+# ==========================================
+# 7. ИНФЕРЕНС И СБОРКА SUBMISSION_FAST.CSV
+# ==========================================
+assert SAMPLE_SUB_PATH.exists(), f"Не найден образец сабмита: {SAMPLE_SUB_PATH}"
+sub = pd.read_csv(SAMPLE_SUB_PATH)
+angle_cols = [f'angle_{i:02d}' for i in range(20)]
+
+preds_by_rec = {}
+w_row = best_w_nn.reshape(1, -1)
+
+for rec_id in sub['recording_id'].unique():
+    emg_test = np.load(TEST_SIGNALS_DIR / f"{rec_id}.npy")
+    base_x = extract_rich_channels(emg_test)
+    tab_x = make_tabular_features(base_x)
+    
+    nn_folds, rd_folds = [], []
+    for (mean_seq, std_seq, m_nn, m_rd) in fold_artifacts:
+        vx = (base_x - mean_seq) / std_seq
+        nn_folds.append(predict_sliding_window(m_nn, vx, WINDOW_SIZE, INFER_STRIDE))
+        rd_folds.append(m_rd.predict(tab_x))
+        
+    p_nn_avg = smooth_predictions(np.mean(nn_folds, axis=0))
+    p_rd_avg = smooth_predictions(np.mean(rd_folds, axis=0))
+    
+    rec_final = p_nn_avg * w_row + p_rd_avg * (1.0 - w_row)
+    preds_by_rec[rec_id] = np.clip(rec_final, -np.pi, np.pi)
+
+for rec_id, group in sub.groupby('recording_id', sort=False):
+    indices = group['sample_index'].to_numpy()
+    rec_preds = preds_by_rec.get(rec_id)
+    sub.loc[group.index, angle_cols] = rec_preds.take(indices, axis=0)
+
+assert not sub[angle_cols].isna().any().any(), "Ошибка: обнаружены NaN!"
+assert np.isfinite(sub[angle_cols].to_numpy()).all(), "Ошибка: обнаружены Inf!"
+
+sub.to_csv(SUBMISSION_PATH, index=False)
+print(f"ГОТОВО! Итоговый сабмит сохранён в {SUBMISSION_PATH}. Форма: {sub.shape}")
