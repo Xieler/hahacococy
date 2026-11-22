@@ -1,0 +1,292 @@
+import time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, sosfilt, savgol_filter, lfilter
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+ 
+# ==========================================
+# НАСТРОЙКИ 2-ГО ЭТАПА (ПРОВЕРЬ ПУТИ)
+# ==========================================
+DATA_DIR = Path('datasets')
+TEST_DIR = DATA_DIR / 'test'
+SAMPLE_SUB_PATH = DATA_DIR / 'phase2_sample_submission.csv'
+OUT_SUB_PATH = Path('submission_final.csv')
+ 
+CKPT_1D_PATH = Path('ckpt_1d.pt')
+CKPT_2D_PATH = Path('ckpt_2d.pt')
+ 
+# Лучшая проверенная комбинация (честный OOF MAE = 0.11082)
+W_1D, W_2D = 0.80, 0.20
+ 
+FS = 500.0
+HOP = 8
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+IS_CUDA = (DEVICE.type == 'cuda')
+_HANN_WIN = torch.hann_window(64, device=DEVICE)
+ 
+def smooth_predictions(preds: np.ndarray, window: int = 45, poly: int = 3) -> np.ndarray:
+    n = len(preds)
+    if window <= poly or n <= poly + 2:
+        return preds
+    w = min(window, n if n % 2 == 1 else n - 1)
+    return savgol_filter(preds, window_length=w, polyorder=poly, axis=0) if w > poly else preds
+ 
+def causal_ema(arr: np.ndarray, alpha: float) -> np.ndarray:
+    b = np.array([alpha], dtype=np.float32)
+    a = np.array([1.0, -(1.0 - alpha)], dtype=np.float32)
+    zi = arr.take(0, axis=0).reshape(1, -1) * (1.0 - alpha)
+    out, _ = lfilter(b, a, arr, axis=0, zi=zi)
+    return out.astype(np.float32)
+ 
+def extract_1d_channels(emg: np.ndarray) -> np.ndarray:
+    emg = emg.astype(np.float32)
+    med = np.median(emg, axis=0, keepdims=True)
+    centered = emg - med
+    p90 = np.percentile(np.abs(centered), 90, axis=0, keepdims=True)
+    norm_emg = np.clip(centered / np.maximum(p90, 1e-4), -8.0, 8.0)
+    feats = [norm_emg]
+    for low, high in ((15.0, 45.0), (45.0, 95.0), (95.0, 160.0), (160.0, 240.0)):
+        sos = butter(4, (low, high), btype='bandpass', fs=FS, output='sos')
+        filt = sosfilt(sos, norm_emg, axis=0).astype(np.float32)
+        feats.append(np.log1p(causal_ema(np.abs(filt), alpha=0.07) * 5.0))
+    tkeo = np.zeros_like(norm_emg)
+    if len(norm_emg) > 2:
+        tkeo[1:-1] = np.abs(norm_emg[1:-1] ** 2 - norm_emg[:-2] * norm_emg[2:])
+    feats.append(np.log1p(causal_ema(tkeo, alpha=0.05) * 3.0))
+    diff_abs = np.vstack((np.zeros((1, 6), dtype=np.float32), np.abs(np.diff(norm_emg, axis=0))))
+    feats.append(np.log1p(causal_ema(diff_abs, alpha=0.04) * 5.0))
+    feats.append(np.log1p(causal_ema(np.abs(norm_emg), alpha=0.015) * 5.0))
+    return np.nan_to_num(np.concatenate(feats, axis=1), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+ 
+def make_1d_tabular(base_feats: np.ndarray) -> np.ndarray:
+    env_only = base_feats[:, 6:]
+    out_list = []
+    for lag in (-60, -30, -15, 0, 15, 30, 60, 100):
+        if lag == 0:
+            shifted = env_only
+        elif lag > 0:
+            shifted = np.vstack((np.repeat(env_only[:1], lag, axis=0), env_only[:-lag]))
+        else:
+            k = -lag
+            shifted = np.vstack((env_only[k:], np.repeat(env_only[-1:], k, axis=0)))
+        out_list.append(shifted)
+    return np.hstack(out_list).astype(np.float32)
+ 
+def compute_2d_stft(emg: np.ndarray) -> np.ndarray:
+    emg = emg.astype(np.float32)
+    med = np.median(emg, axis=0, keepdims=True)
+    centered = emg - med
+    p90 = np.percentile(np.abs(centered), 90, axis=0, keepdims=True)
+    norm_emg = np.clip(centered / np.maximum(p90, 1e-4), -8.0, 8.0)
+    with torch.no_grad():
+        sig_t = torch.from_numpy(norm_emg.T).to(DEVICE)
+        stft_out = torch.stft(sig_t, n_fft=64, hop_length=HOP, win_length=64, window=_HANN_WIN, center=True, return_complex=True)
+        mag = torch.log1p(torch.abs(stft_out)[:, :32, :] * 5.0)
+        out = mag.permute(2, 0, 1).cpu().numpy()
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+ 
+def make_2d_tabular(spec: np.ndarray) -> np.ndarray:
+    base = np.hstack((spec[:, :, 1:6].mean(2), spec[:, :, 6:14].mean(2), spec[:, :, 14:24].mean(2), spec[:, :, 24:32].mean(2)))
+    out_list = []
+    for lag in (-6, -3, 0, 3, 6, 10):
+        if lag == 0:
+            shifted = base
+        elif lag > 0:
+            shifted = np.vstack((np.repeat(base[:1], lag, axis=0), base[:-lag]))
+        else:
+            k = -lag
+            shifted = np.vstack((base[k:], np.repeat(base[-1:], k, axis=0)))
+        out_list.append(shifted)
+    return np.hstack(out_list).astype(np.float32)
+ 
+def resample_array(arr: np.ndarray, target_len: int) -> np.ndarray:
+    if len(arr) == target_len:
+        return arr
+    with torch.no_grad():
+        t = torch.from_numpy(arr.T).unsqueeze(0)
+        return F.interpolate(t, size=target_len, mode='linear', align_corners=False).squeeze(0).T.numpy().astype(np.float32)
+ 
+class ResBlock1D(nn.Module):
+    def __init__(self, channels, kernel_size=7, dilation=1, dropout=0.25):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation),
+            nn.GroupNorm(8, channels), nn.SiLU(), nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size, padding=padding, dilation=dilation),
+            nn.GroupNorm(8, channels)
+        )
+        self.act = nn.SiLU()
+    def forward(self, x): return self.act(x + self.net(x))
+ 
+class EMGTCN(nn.Module):
+    def __init__(self, in_channels=48, hidden_dim=80, out_angles=20):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv1d(in_channels, hidden_dim, 11, padding=5), nn.GroupNorm(8, hidden_dim), nn.SiLU())
+        self.tcn = nn.Sequential(
+            ResBlock1D(hidden_dim, 7, 1, 0.20), ResBlock1D(hidden_dim, 7, 3, 0.25),
+            ResBlock1D(hidden_dim, 7, 9, 0.25), ResBlock1D(hidden_dim, 7, 27, 0.30)
+        )
+        self.head = nn.Sequential(nn.Conv1d(hidden_dim, hidden_dim, 5, padding=2), nn.SiLU(), nn.Dropout(0.15), nn.Conv1d(hidden_dim, out_angles, 1))
+    def forward(self, x): return self.head(self.tcn(self.stem(x)))
+ 
+class SEBlock2D(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(),
+            nn.Linear(channels, max(channels // reduction, 4)), nn.SiLU(),
+            nn.Linear(max(channels // reduction, 4), channels), nn.Sigmoid()
+        )
+    def forward(self, x): return x * self.fc(x).unsqueeze(-1).unsqueeze(-1)
+ 
+class ResBlock2D(nn.Module):
+    def __init__(self, channels, dilation_t=1, dropout=0.20):
+        super().__init__()
+        pad_t = 2 * dilation_t
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, (3, 5), padding=(1, pad_t), dilation=(1, dilation_t)),
+            nn.GroupNorm(8, channels), nn.SiLU(), nn.Dropout2d(dropout),
+            nn.Conv2d(channels, channels, (3, 5), padding=(1, pad_t), dilation=(1, dilation_t)),
+            nn.GroupNorm(8, channels), SEBlock2D(channels)
+        )
+        self.act = nn.SiLU()
+    def forward(self, x): return self.act(x + self.conv(x))
+ 
+class EMGSpectroNet(nn.Module):
+    def __init__(self, in_ch=6, hidden_dim=48, out_angles=20):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(in_ch, hidden_dim, (3, 5), stride=(2, 1), padding=(1, 2)), nn.GroupNorm(8, hidden_dim), nn.SiLU())
+        self.stage1 = ResBlock2D(hidden_dim, 1, 0.20)
+        self.down = nn.Sequential(nn.Conv2d(hidden_dim, hidden_dim * 2, (3, 5), stride=(2, 1), padding=(1, 2)), nn.GroupNorm(8, hidden_dim * 2), nn.SiLU())
+        self.stage2 = nn.Sequential(ResBlock2D(hidden_dim * 2, 2, 0.25), ResBlock2D(hidden_dim * 2, 4, 0.25))
+        self.freq_pool = nn.Conv2d(hidden_dim * 2, hidden_dim * 2, (8, 1))
+        self.head = nn.Sequential(nn.Conv1d(hidden_dim * 2, hidden_dim, 3, padding=1), nn.SiLU(), nn.Dropout(0.15), nn.Conv1d(hidden_dim, out_angles, 1))
+    def forward(self, x): return self.head(self.freq_pool(self.stage2(self.down(self.stage1(self.stem(x))))).squeeze(2))
+# ==========================================
+# ФУНКЦИИ СКОЛЬЗЯЩЕГО ИНФЕРЕНСА
+# ==========================================
+def predict_1d_sliding(model: nn.Module, x_feat: np.ndarray, win_size=1024, stride=512) -> np.ndarray:
+    model.eval()
+    T = len(x_feat)
+    if T <= win_size:
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=IS_CUDA):
+            tx = torch.from_numpy(x_feat.T).unsqueeze(0).to(DEVICE)
+            return model(tx).squeeze(0).float().cpu().numpy().T
+ 
+    preds_sum = np.zeros((T, 20), dtype=np.float32)
+    weights_sum = np.zeros((T, 1), dtype=np.float32)
+    win_w = np.maximum(np.hanning(win_size).astype(np.float32).reshape(-1, 1), 1e-3)
+ 
+    starts = list(range(0, T - win_size + 1, stride))
+    if starts[-1] != T - win_size:
+        starts.append(T - win_size)
+ 
+    batch_tensor = torch.from_numpy(np.stack([x_feat[s:s + win_size].T for s in starts])).to(DEVICE)
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=IS_CUDA):
+        out_list = [model(batch_tensor[i:i + 32]).float().cpu().numpy() for i in range(0, len(batch_tensor), 32)]
+        all_out = np.concatenate(out_list, axis=0)
+ 
+    for idx, s in enumerate(starts):
+        preds_sum[s:s + win_size] += all_out[idx].T * win_w
+        weights_sum[s:s + win_size] += win_w
+    return preds_sum / weights_sum
+ 
+def predict_2d_turbo(model: nn.Module, x_spec: np.ndarray, target_len: int, win_frames=128, stride=64) -> np.ndarray:
+    model.eval()
+    Tf = len(x_spec)
+    if Tf <= win_frames:
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=IS_CUDA):
+            tx = torch.from_numpy(np.transpose(x_spec, (1, 2, 0))).unsqueeze(0).to(DEVICE)
+            pred_f = model(tx).squeeze(0).float().cpu().numpy().T
+        return resample_array(pred_f, target_len)
+ 
+    preds_sum = np.zeros((Tf, 20), dtype=np.float32)
+    weights_sum = np.zeros((Tf, 1), dtype=np.float32)
+    win_w = np.maximum(np.hanning(win_frames).astype(np.float32).reshape(-1, 1), 1e-3)
+ 
+    starts = list(range(0, Tf - win_frames + 1, stride))
+    if starts[-1] != Tf - win_frames:
+        starts.append(Tf - win_frames)
+ 
+    batch_tensor = torch.from_numpy(np.stack([np.transpose(x_spec[s:s + win_frames], (1, 2, 0)) for s in starts])).to(DEVICE)
+    with torch.no_grad(), torch.amp.autocast('cuda', enabled=IS_CUDA):
+        all_out = model(batch_tensor).float().cpu().numpy()
+ 
+    for idx, s in enumerate(starts):
+        preds_sum[s:s + win_frames] += all_out[idx].T * win_w
+        weights_sum[s:s + win_frames] += win_w
+ 
+    return resample_array(preds_sum / weights_sum, target_len)
+ 
+# ==========================================
+# ЗАГРУЗКА ЧЕКПОИНТОВ И СБОРКА ФИНАЛЬНОГО САБМИТА
+# ==========================================
+t0 = time.time()
+for p in (CKPT_1D_PATH, CKPT_2D_PATH, SAMPLE_SUB_PATH):
+    assert p.exists(), f"Не найден обязательный файл: {p}"
+ 
+print(f"Устройство: {DEVICE} | Загрузка чекпоинтов 1D-TCN и 2D-SpectroNet...")
+ckpt_1d = torch.load(CKPT_1D_PATH, map_location=DEVICE, weights_only=False)
+ckpt_2d = torch.load(CKPT_2D_PATH, map_location=DEVICE, weights_only=False)
+ 
+arts_1d, w_1d_j = ckpt_1d['fold_artifacts'], ckpt_1d['best_w_nn'].reshape(1, -1)
+arts_2d, w_2d_j = ckpt_2d['fold_artifacts'], ckpt_2d['best_w_nn'].reshape(1, -1)
+ 
+for _, _, m, _ in arts_1d + arts_2d:
+    m.to(DEVICE)
+ 
+sub = pd.read_csv(SAMPLE_SUB_PATH)
+angle_cols = [f'angle_{i:02d}' for i in range(20)]
+unique_recs = sub['recording_id'].unique()
+print(f"Запуск финального инференса для {len(unique_recs)} тестовых записей...")
+ 
+preds_by_rec = {}
+for idx, rec_id in enumerate(unique_recs, 1):
+    test_file = TEST_DIR / f"{rec_id}.npy"
+    assert test_file.exists(), f"Не найден файл тестовой записи: {test_file}"
+    emg_test = np.load(test_file)
+    T_test = len(emg_test)
+ 
+    # Признаки для 1D-модели
+    b1 = extract_1d_channels(emg_test)
+    t1 = make_1d_tabular(b1)
+ 
+    # Признаки для 2D-модели
+    s2 = compute_2d_stft(emg_test)
+    t2 = make_2d_tabular(s2)
+ 
+    # 1. Прогноз 1D-TCN (7 фолдов)
+    nn1_f, rd1_f = [], []
+    for mean_s, std_s, m_nn, m_rd in arts_1d:
+        nn1_f.append(predict_1d_sliding(m_nn, (b1 - mean_s) / std_s, win_size=1024, stride=512))
+        rd1_f.append(m_rd.predict(t1))
+    pred_1d = smooth_predictions(np.mean(nn1_f, axis=0)) * w_1d_j + smooth_predictions(np.mean(rd1_f, axis=0)) * (1.0 - w_1d_j)
+ 
+    # 2. Прогноз 2D-SpectroNet (7 фолдов)
+    nn2_f, rd2_f = [], []
+    for mean_s, std_s, m_nn, m_rd in arts_2d:
+        nn2_f.append(predict_2d_turbo(m_nn, (s2 - mean_s) / std_s, T_test, win_frames=128, stride=64))
+        rd2_f.append(resample_array(m_rd.predict(t2).astype(np.float32), T_test))
+    pred_2d = smooth_predictions(np.mean(nn2_f, axis=0)) * w_2d_j + smooth_predictions(np.mean(rd2_f, axis=0)) * (1.0 - w_2d_j)
+ 
+    # Финальный бленд (80% 1D + 20% 2D)
+    final_rec = W_1D * pred_1d + W_2D * pred_2d
+    preds_by_rec[rec_id] = np.clip(final_rec, -np.pi, np.pi)
+ 
+    if idx % 8 == 0 or idx == len(unique_recs):
+        print(f"Обработано {idx}/{len(unique_recs)} записей ({time.time() - t0:.1f} сек.)")
+ 
+for rec_id, group in sub.groupby('recording_id', sort=False):
+    indices = group['sample_index'].to_numpy()
+    rec_preds = preds_by_rec.get(rec_id)
+    sub.loc[group.index, angle_cols] = rec_preds.take(indices, axis=0)
+ 
+assert not sub[angle_cols].isna().any().any(), "Ошибка: обнаружены NaN!"
+assert np.isfinite(sub[angle_cols].to_numpy()).all(), "Ошибка: обнаружены Inf!"
+ 
+sub.to_csv(OUT_SUB_PATH, index=False)
+print(f"\nУСПЕШНО! Финальный сабмит 2-го этапа сохранён в {OUT_SUB_PATH}. Форма: {sub.shape}")
